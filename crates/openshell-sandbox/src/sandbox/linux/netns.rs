@@ -345,6 +345,43 @@ impl NetworkNamespace {
             }
         }
 
+        // Enable IP forwarding and NAT on the host side of the veth for DNS.
+        if let Some(dns_ip) = resolve_dns_server() {
+            let dns_ip_str = dns_ip.to_string();
+            let sandbox_ip_str = self.sandbox_ip.to_string();
+
+            let forwarding_path = format!(
+                "/proc/sys/net/ipv4/conf/{}/forwarding",
+                self.veth_host
+            );
+            if let Err(e) = std::fs::write(&forwarding_path, "1") {
+                warn!(
+                    error = %e,
+                    path = %forwarding_path,
+                    "Failed to enable IP forwarding on host veth (DNS may not work)"
+                );
+            }
+            let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+
+            let dns_cidr = format!("{dns_ip_str}/32");
+            let sandbox_cidr = format!("{sandbox_ip_str}/32");
+            let _ = Command::new(&iptables_path)
+                .args(["-t", "nat", "-A", "POSTROUTING", "-s", &sandbox_cidr, "-d", &dns_cidr, "-p", "udp", "--dport", "53", "-j", "MASQUERADE"])
+                .output();
+            let _ = Command::new(&iptables_path)
+                .args(["-A", "FORWARD", "-s", &sandbox_cidr, "-d", &dns_cidr, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+                .output();
+            let _ = Command::new(&iptables_path)
+                .args(["-A", "FORWARD", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+                .output();
+
+            info!(
+                dns_server = %dns_ip_str,
+                veth = %self.veth_host,
+                "Enabled DNS forwarding from sandbox to cluster nameserver"
+            );
+        }
+
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
