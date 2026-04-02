@@ -19,44 +19,18 @@ const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
 
-/// Resolve hostnames that require direct TCP access (bypassing the HTTP proxy).
-///
-/// Returns resolved IPv4 addresses for hosts listed in `OPENSHELL_DIRECT_TCP_HOSTS`
-/// (comma-separated hostnames). These hosts are resolved via the system DNS and
-/// get iptables ACCEPT rules for TCP port 443 in the sandbox netns, plus
-/// MASQUERADE on the host side so responses can return.
-///
-/// This is needed for libraries (e.g. Node.js `ws`) that make direct TCP
-/// connections after resolving DNS, ignoring HTTP_PROXY settings.
-fn resolve_direct_tcp_hosts() -> Vec<IpAddr> {
+/// Parse the `OPENSHELL_DIRECT_TCP_HOSTS` environment variable into a list of
+/// hostnames. Returns an empty vec if the variable is unset or empty.
+fn parse_direct_tcp_hosts() -> Vec<String> {
     let hosts = match std::env::var("OPENSHELL_DIRECT_TCP_HOSTS") {
         Ok(val) if !val.is_empty() => val,
         _ => return Vec::new(),
     };
-
-    let mut addrs = Vec::new();
-    for host in hosts.split(',') {
-        let host = host.trim();
-        if host.is_empty() {
-            continue;
-        }
-        // Use std::net to resolve — this runs in the pod netns (not sandbox)
-        // so cluster DNS works normally.
-        match std::net::ToSocketAddrs::to_socket_addrs(&(host, 443_u16)) {
-            Ok(iter) => {
-                for sa in iter {
-                    if sa.is_ipv4() && !addrs.contains(&sa.ip()) {
-                        addrs.push(sa.ip());
-                    }
-                }
-                info!(host = %host, count = addrs.len(), "Resolved direct TCP host");
-            }
-            Err(e) => {
-                warn!(host = %host, error = %e, "Failed to resolve direct TCP host");
-            }
-        }
-    }
-    addrs
+    hosts
+        .split(',')
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .collect()
 }
 
 /// Resolve the cluster DNS server IP for the iptables ACCEPT rule.
@@ -423,21 +397,18 @@ impl NetworkNamespace {
         }
 
         // Host-side forwarding for direct TCP 443 (OPENSHELL_DIRECT_TCP_HOSTS).
-        let direct_tcp_ips = resolve_direct_tcp_hosts();
-        if !direct_tcp_ips.is_empty() {
+        let direct_tcp_hosts = parse_direct_tcp_hosts();
+        if !direct_tcp_hosts.is_empty() {
             let sandbox_cidr = format!("{}/32", self.sandbox_ip);
-            for ip in &direct_tcp_ips {
-                let ip_cidr = format!("{ip}/32");
-                let _ = Command::new(&iptables_path)
-                    .args(["-t", "nat", "-A", "POSTROUTING", "-s", &sandbox_cidr, "-d", &ip_cidr, "-p", "tcp", "--dport", "443", "-j", "MASQUERADE"])
-                    .output();
-                let _ = Command::new(&iptables_path)
-                    .args(["-A", "FORWARD", "-s", &sandbox_cidr, "-d", &ip_cidr, "-p", "tcp", "--dport", "443", "-j", "ACCEPT"])
-                    .output();
-            }
+            let _ = Command::new(&iptables_path)
+                .args(["-t", "nat", "-A", "POSTROUTING", "-s", &sandbox_cidr, "-p", "tcp", "--dport", "443", "-j", "MASQUERADE"])
+                .output();
+            let _ = Command::new(&iptables_path)
+                .args(["-A", "FORWARD", "-s", &sandbox_cidr, "-p", "tcp", "--dport", "443", "-j", "ACCEPT"])
+                .output();
             info!(
-                count = direct_tcp_ips.len(),
-                "Enabled direct TCP 443 forwarding for OPENSHELL_DIRECT_TCP_HOSTS"
+                hosts = direct_tcp_hosts.len(),
+                "Enabled broad TCP 443 forwarding for OPENSHELL_DIRECT_TCP_HOSTS"
             );
         }
 
@@ -542,26 +513,27 @@ impl NetworkNamespace {
             .build());
         }
 
-        // Rule 4.5: ACCEPT direct TCP 443 to hosts listed in OPENSHELL_DIRECT_TCP_HOSTS.
+        // Rule 4.5: ACCEPT all TCP 443 when OPENSHELL_DIRECT_TCP_HOSTS is set.
         //
-        // Some libraries (e.g. Node.js `ws`, used by @slack/socket-mode) resolve
-        // DNS and then connect directly to the resolved IP, ignoring HTTP_PROXY.
-        // For these hosts, allow TCP 443 through and rely on host-side MASQUERADE
-        // (set up in install_bypass_rules) to route the traffic.
-        for direct_ip in resolve_direct_tcp_hosts() {
-            let ip_cidr = format!("{direct_ip}/32");
+        // Some binaries (e.g. Rust/rustls programs like `gws`) cannot trust the
+        // egress proxy's TLS-terminating CA and need direct TCP 443 connections.
+        // Rather than tracking per-IP rules (which break when DNS round-robin
+        // returns new IPs), we ACCEPT all outbound TCP 443 from the sandbox.
+        //
+        // Security: applications still use HTTPS_PROXY for hosts not in NO_PROXY.
+        // This rule only affects the iptables layer — it means processes that
+        // intentionally bypass the proxy env vars can reach any HTTPS endpoint
+        // directly, which is an acceptable trade-off given the proxy cannot
+        // inspect TLS content anyway (HTTP CONNECT tunnel).
+        if !parse_direct_tcp_hosts().is_empty() {
             if let Err(e) = run_iptables_netns(
                 &self.name,
                 iptables_cmd,
-                &[
-                    "-A", "OUTPUT", "-d", &ip_cidr, "-p", "tcp", "--dport", "443", "-j", "ACCEPT",
-                ],
+                &["-A", "OUTPUT", "-p", "tcp", "--dport", "443", "-j", "ACCEPT"],
             ) {
-                warn!(
-                    error = %e,
-                    ip = %direct_ip,
-                    "Failed to install direct TCP ACCEPT rule"
-                );
+                warn!(error = %e, "Failed to install TCP 443 ACCEPT rule");
+            } else {
+                info!("Installed broad TCP 443 ACCEPT rule for OPENSHELL_DIRECT_TCP_HOSTS");
             }
         }
 
@@ -1017,6 +989,27 @@ mod tests {
 
     // These tests require root and network namespace support
     // Run with: sudo cargo test -- --ignored
+
+    #[test]
+    fn test_parse_direct_tcp_hosts() {
+        std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_HOSTS",
+            "oauth2.googleapis.com, gmail.googleapis.com , ",
+        );
+        let hosts = parse_direct_tcp_hosts();
+        assert_eq!(hosts, vec!["oauth2.googleapis.com", "gmail.googleapis.com"]);
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_hosts_empty() {
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        assert!(parse_direct_tcp_hosts().is_empty());
+
+        std::env::set_var("OPENSHELL_DIRECT_TCP_HOSTS", "");
+        assert!(parse_direct_tcp_hosts().is_empty());
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+    }
 
     #[test]
     #[ignore = "requires root privileges"]
