@@ -33,6 +33,84 @@ fn parse_direct_tcp_hosts() -> Vec<String> {
         .collect()
 }
 
+/// A single `host:port` endpoint for direct TCP bypass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectTcpEndpoint {
+    host: String,
+    port: u16,
+}
+
+/// Parse `OPENSHELL_DIRECT_TCP_ENDPOINTS` (comma-separated `host:port` pairs).
+///
+/// Each entry bypasses the egress proxy with per-endpoint iptables ACCEPT on
+/// the sandbox side and MASQUERADE + FORWARD on the host side. Use for arbitrary
+/// TCP ports beyond 443 (postgres 5432, redis 6379, smtp 1025, etc.) that the
+/// egress proxy rejects or that raw-TCP clients need.
+///
+/// `host` may be an IPv4 literal or a hostname. Hostnames are resolved at pod
+/// startup via the cluster resolver.
+fn parse_direct_tcp_endpoints() -> Vec<DirectTcpEndpoint> {
+    let raw = match std::env::var("OPENSHELL_DIRECT_TCP_ENDPOINTS") {
+        Ok(val) if !val.is_empty() => val,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((host, port)) = entry.rsplit_once(':') else {
+            warn!(entry = %entry, "OPENSHELL_DIRECT_TCP_ENDPOINTS entry missing ':port'");
+            continue;
+        };
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        let port: u16 = match port.trim().parse() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(entry = %entry, error = %e, "Invalid port in OPENSHELL_DIRECT_TCP_ENDPOINTS");
+                continue;
+            }
+        };
+        if host.is_empty() {
+            continue;
+        }
+        out.push(DirectTcpEndpoint { host: host.to_owned(), port });
+    }
+    out
+}
+
+/// Resolve a direct-TCP endpoint to one or more IPv4 addresses.
+///
+/// IPv4 literals pass through unchanged. Hostnames are resolved via the system
+/// resolver (running in the pod netns where cluster DNS works). IPv6 addresses
+/// are dropped — sandbox netns rules are IPv4-only.
+fn resolve_endpoint_ipv4s(ep: &DirectTcpEndpoint) -> Vec<std::net::Ipv4Addr> {
+    if let Ok(addr) = ep.host.parse::<std::net::Ipv4Addr>() {
+        return vec![addr];
+    }
+    match std::net::ToSocketAddrs::to_socket_addrs(&(ep.host.as_str(), ep.port)) {
+        Ok(iter) => {
+            let mut seen = Vec::new();
+            for sa in iter {
+                if let std::net::IpAddr::V4(ip) = sa.ip() {
+                    if !seen.contains(&ip) {
+                        seen.push(ip);
+                    }
+                }
+            }
+            if seen.is_empty() {
+                warn!(host = %ep.host, "No IPv4 address resolved for direct-TCP endpoint");
+            }
+            seen
+        }
+        Err(e) => {
+            warn!(host = %ep.host, error = %e, "Failed to resolve direct-TCP endpoint");
+            Vec::new()
+        }
+    }
+}
+
 /// Resolve the cluster DNS server IP for the iptables ACCEPT rule.
 ///
 /// Priority:
@@ -412,6 +490,45 @@ impl NetworkNamespace {
             );
         }
 
+        // Host-side forwarding for OPENSHELL_DIRECT_TCP_ENDPOINTS (host:port
+        // pairs). Per-endpoint MASQUERADE + FORWARD on the specific dest IP and
+        // port so the sandbox can reach services on the pod host (e.g. postgres
+        // 5432, redis 6379) without going through the egress proxy — which
+        // blocks well-known DB ports and does not handle raw TCP protocols.
+        let direct_tcp_endpoints = parse_direct_tcp_endpoints();
+        if !direct_tcp_endpoints.is_empty() {
+            let sandbox_cidr = format!("{}/32", self.sandbox_ip);
+            let mut installed = 0usize;
+            for ep in &direct_tcp_endpoints {
+                let port_str = ep.port.to_string();
+                for ip in resolve_endpoint_ipv4s(ep) {
+                    let ip_cidr = format!("{ip}/32");
+                    let _ = Command::new(&iptables_path)
+                        .args([
+                            "-t", "nat", "-A", "POSTROUTING",
+                            "-s", &sandbox_cidr, "-d", &ip_cidr,
+                            "-p", "tcp", "--dport", &port_str,
+                            "-j", "MASQUERADE",
+                        ])
+                        .output();
+                    let _ = Command::new(&iptables_path)
+                        .args([
+                            "-A", "FORWARD",
+                            "-s", &sandbox_cidr, "-d", &ip_cidr,
+                            "-p", "tcp", "--dport", &port_str,
+                            "-j", "ACCEPT",
+                        ])
+                        .output();
+                    installed += 1;
+                }
+            }
+            info!(
+                endpoints = direct_tcp_endpoints.len(),
+                rules = installed,
+                "Enabled direct TCP forwarding for OPENSHELL_DIRECT_TCP_ENDPOINTS"
+            );
+        }
+
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
@@ -534,6 +651,49 @@ impl NetworkNamespace {
                 warn!(error = %e, "Failed to install TCP 443 ACCEPT rule");
             } else {
                 info!("Installed broad TCP 443 ACCEPT rule for OPENSHELL_DIRECT_TCP_HOSTS");
+            }
+        }
+
+        // Rule 4.6: ACCEPT per-endpoint direct TCP for OPENSHELL_DIRECT_TCP_ENDPOINTS.
+        //
+        // Unlike DIRECT_TCP_HOSTS (broad TCP 443), endpoints are dest-IP + dport
+        // pairs — required for non-HTTPS services the proxy can't/won't handle:
+        // postgres/redis wire protocols, and ports the proxy explicitly blocks
+        // (e.g. 5432/6379 hardcoded).
+        let endpoints = parse_direct_tcp_endpoints();
+        if !endpoints.is_empty() {
+            let mut accepted = 0usize;
+            for ep in &endpoints {
+                let port_str = ep.port.to_string();
+                for ip in resolve_endpoint_ipv4s(ep) {
+                    let ip_cidr = format!("{ip}/32");
+                    if let Err(e) = run_iptables_netns(
+                        &self.name,
+                        iptables_cmd,
+                        &[
+                            "-A", "OUTPUT",
+                            "-d", &ip_cidr,
+                            "-p", "tcp", "--dport", &port_str,
+                            "-j", "ACCEPT",
+                        ],
+                    ) {
+                        warn!(
+                            error = %e,
+                            ip = %ip,
+                            port = ep.port,
+                            "Failed to install direct TCP endpoint ACCEPT rule"
+                        );
+                    } else {
+                        accepted += 1;
+                    }
+                }
+            }
+            if accepted > 0 {
+                info!(
+                    rules = accepted,
+                    endpoints = endpoints.len(),
+                    "Installed direct TCP endpoint ACCEPT rules for OPENSHELL_DIRECT_TCP_ENDPOINTS"
+                );
             }
         }
 
@@ -1009,6 +1169,47 @@ mod tests {
         std::env::set_var("OPENSHELL_DIRECT_TCP_HOSTS", "");
         assert!(parse_direct_tcp_hosts().is_empty());
         std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_endpoints_basic() {
+        std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_ENDPOINTS",
+            "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
+        );
+        let eps = parse_direct_tcp_endpoints();
+        assert_eq!(
+            eps,
+            vec![
+                DirectTcpEndpoint { host: "10.0.1.215".into(), port: 5432 },
+                DirectTcpEndpoint { host: "10.0.1.215".into(), port: 6379 },
+                DirectTcpEndpoint { host: "db.internal".into(), port: 1025 },
+            ]
+        );
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_endpoints_invalid_entries_skipped() {
+        std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_ENDPOINTS",
+            "host-no-port, :5432, host:abc, good.internal:8025",
+        );
+        let eps = parse_direct_tcp_endpoints();
+        assert_eq!(
+            eps,
+            vec![DirectTcpEndpoint { host: "good.internal".into(), port: 8025 }]
+        );
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+    }
+
+    #[test]
+    fn test_parse_direct_tcp_endpoints_empty() {
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        assert!(parse_direct_tcp_endpoints().is_empty());
+        std::env::set_var("OPENSHELL_DIRECT_TCP_ENDPOINTS", "");
+        assert!(parse_direct_tcp_endpoints().is_empty());
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
     }
 
     #[test]
