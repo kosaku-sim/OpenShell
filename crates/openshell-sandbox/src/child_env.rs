@@ -6,19 +6,35 @@ use std::path::Path;
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
 /// Build the NO_PROXY value by combining localhost entries with any hosts
-/// listed in `OPENSHELL_DIRECT_TCP_HOSTS`. Those hosts have iptables ACCEPT
-/// rules for direct TCP 443 (set up by netns), so HTTP clients must also
-/// skip the proxy to avoid TLS termination issues with non-Node binaries
-/// (e.g. Rust/rustls programs that cannot trust the egress proxy CA).
+/// listed in `OPENSHELL_DIRECT_TCP_HOSTS` / `OPENSHELL_DIRECT_TCP_ENDPOINTS`.
+/// Those hosts have iptables ACCEPT rules for direct TCP (set up by netns),
+/// so HTTP clients must also skip the proxy to avoid TLS termination issues
+/// with non-Node binaries (e.g. Rust/rustls programs that cannot trust the
+/// egress proxy CA).
 fn build_no_proxy() -> String {
     let mut no_proxy = LOCAL_NO_PROXY.to_owned();
+    let mut push_host = |raw: &str| {
+        let host = raw.trim();
+        if host.is_empty() {
+            return;
+        }
+        no_proxy.push(',');
+        no_proxy.push_str(host);
+    };
     if let Ok(hosts) = std::env::var("OPENSHELL_DIRECT_TCP_HOSTS") {
         for host in hosts.split(',') {
-            let host = host.trim();
-            if !host.is_empty() {
-                no_proxy.push(',');
-                no_proxy.push_str(host);
+            push_host(host);
+        }
+    }
+    if let Ok(endpoints) = std::env::var("OPENSHELL_DIRECT_TCP_ENDPOINTS") {
+        for entry in endpoints.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
             }
+            let host = entry.rsplit_once(':').map(|(h, _)| h).unwrap_or(entry);
+            let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+            push_host(host);
         }
     }
     no_proxy
@@ -86,6 +102,7 @@ mod tests {
 
     #[test]
     fn no_proxy_includes_direct_tcp_hosts() {
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
         std::env::set_var(
             "OPENSHELL_DIRECT_TCP_HOSTS",
             "oauth2.googleapis.com,gmail.googleapis.com",
@@ -99,6 +116,23 @@ mod tests {
 
         // Clean up
         std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+    }
+
+    #[test]
+    fn no_proxy_includes_direct_tcp_endpoints() {
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_ENDPOINTS",
+            "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
+        );
+
+        let no_proxy = build_no_proxy();
+        assert_eq!(
+            no_proxy,
+            "127.0.0.1,localhost,::1,10.0.1.215,10.0.1.215,db.internal"
+        );
+
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
     }
 
     #[test]
