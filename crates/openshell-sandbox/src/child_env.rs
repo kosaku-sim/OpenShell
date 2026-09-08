@@ -5,15 +5,51 @@ use std::path::Path;
 
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
+/// Build the NO_PROXY value by combining localhost entries with any hosts
+/// listed in `OPENSHELL_DIRECT_TCP_HOSTS` / `OPENSHELL_DIRECT_TCP_ENDPOINTS`.
+/// Those hosts have iptables ACCEPT rules for direct TCP (set up by netns),
+/// so HTTP clients must also skip the proxy to avoid TLS termination issues
+/// with non-Node binaries (e.g. Rust/rustls programs that cannot trust the
+/// egress proxy CA).
+fn build_no_proxy() -> String {
+    let mut no_proxy = LOCAL_NO_PROXY.to_owned();
+    let mut push_host = |raw: &str| {
+        let host = raw.trim();
+        if host.is_empty() {
+            return;
+        }
+        no_proxy.push(',');
+        no_proxy.push_str(host);
+    };
+    if let Ok(hosts) = std::env::var("OPENSHELL_DIRECT_TCP_HOSTS") {
+        for host in hosts.split(',') {
+            push_host(host);
+        }
+    }
+    if let Ok(endpoints) = std::env::var("OPENSHELL_DIRECT_TCP_ENDPOINTS") {
+        for entry in endpoints.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let host = entry.rsplit_once(':').map(|(h, _)| h).unwrap_or(entry);
+            let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+            push_host(host);
+        }
+    }
+    no_proxy
+}
+
 pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
+    let no_proxy = build_no_proxy();
     [
         ("ALL_PROXY", proxy_url.to_owned()),
         ("HTTP_PROXY", proxy_url.to_owned()),
         ("HTTPS_PROXY", proxy_url.to_owned()),
-        ("NO_PROXY", LOCAL_NO_PROXY.to_owned()),
+        ("NO_PROXY", no_proxy.clone()),
         ("http_proxy", proxy_url.to_owned()),
         ("https_proxy", proxy_url.to_owned()),
-        ("no_proxy", LOCAL_NO_PROXY.to_owned()),
+        ("no_proxy", no_proxy),
         ("grpc_proxy", proxy_url.to_owned()),
         // Node.js only honors HTTP(S)_PROXY for built-in fetch/http clients when
         // proxy support is explicitly enabled at process startup.
@@ -43,6 +79,9 @@ mod tests {
 
     #[test]
     fn apply_proxy_env_includes_node_proxy_opt_in_and_local_bypass() {
+        // Ensure no leftover env from other tests affects NO_PROXY
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+
         let mut cmd = Command::new("/usr/bin/env");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -59,6 +98,41 @@ mod tests {
         assert!(stdout.contains("NO_PROXY=127.0.0.1,localhost,::1"));
         assert!(stdout.contains("NODE_USE_ENV_PROXY=1"));
         assert!(stdout.contains("no_proxy=127.0.0.1,localhost,::1"));
+    }
+
+    #[test]
+    fn no_proxy_includes_direct_tcp_hosts() {
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
+        std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_HOSTS",
+            "oauth2.googleapis.com,gmail.googleapis.com",
+        );
+
+        let no_proxy = build_no_proxy();
+        assert_eq!(
+            no_proxy,
+            "127.0.0.1,localhost,::1,oauth2.googleapis.com,gmail.googleapis.com"
+        );
+
+        // Clean up
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+    }
+
+    #[test]
+    fn no_proxy_includes_direct_tcp_endpoints() {
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_HOSTS");
+        std::env::set_var(
+            "OPENSHELL_DIRECT_TCP_ENDPOINTS",
+            "10.0.1.215:5432, 10.0.1.215:6379 , db.internal:1025,",
+        );
+
+        let no_proxy = build_no_proxy();
+        assert_eq!(
+            no_proxy,
+            "127.0.0.1,localhost,::1,10.0.1.215,10.0.1.215,db.internal"
+        );
+
+        std::env::remove_var("OPENSHELL_DIRECT_TCP_ENDPOINTS");
     }
 
     #[test]
