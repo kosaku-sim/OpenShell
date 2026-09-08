@@ -35,16 +35,38 @@ impl SecretResolver {
     }
 
     pub(crate) fn rewrite_header_value(&self, value: &str) -> Option<String> {
-        if let Some(secret) = self.resolve_placeholder(value.trim()) {
+        let trimmed = value.trim();
+        if let Some(secret) = self.resolve_placeholder(trimmed) {
             return Some(secret.to_string());
         }
 
-        let trimmed = value.trim();
         let split_at = trimmed.find(char::is_whitespace)?;
         let prefix = &trimmed[..split_at];
         let candidate = trimmed[split_at..].trim();
-        let secret = self.resolve_placeholder(candidate)?;
-        Some(format!("{prefix} {secret}"))
+        if let Some(secret) = self.resolve_placeholder(candidate) {
+            return Some(format!("{prefix} {secret}"));
+        }
+
+        // HTTP Basic auth carries the credential base64-encoded as
+        // `Basic base64("<user>:<password>")`, so a placeholder in the password
+        // is invisible to the whitespace-split path above. git-over-HTTPS only
+        // accepts Basic (not Bearer/token), so without this branch a sandbox
+        // using a placeholder credential (e.g. `gh auth git-credential`
+        // returning `openshell:resolve:env:GITHUB_TOKEN`) cannot authenticate
+        // git fetch/push. Decode, resolve the password segment if it is a
+        // placeholder, and re-encode; leave the username untouched.
+        if prefix.eq_ignore_ascii_case("basic") {
+            use base64::Engine as _;
+            let engine = base64::engine::general_purpose::STANDARD;
+            let decoded = engine.decode(candidate).ok()?;
+            let creds = String::from_utf8(decoded).ok()?;
+            let (user, pass) = creds.split_once(':')?;
+            let secret = self.resolve_placeholder(pass)?;
+            let reencoded = engine.encode(format!("{user}:{secret}"));
+            return Some(format!("{prefix} {reencoded}"));
+        }
+
+        None
     }
 }
 
@@ -99,6 +121,37 @@ pub(crate) fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_placeholder_inside_basic_auth() {
+        use base64::Engine as _;
+        let (_child, resolver) = SecretResolver::from_provider_env(
+            [("GITHUB_TOKEN".to_string(), "ghp_real".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.unwrap();
+        let engine = base64::engine::general_purpose::STANDARD;
+        let blob = engine.encode("x-access-token:openshell:resolve:env:GITHUB_TOKEN");
+        let out = resolver
+            .rewrite_header_value(&format!("Basic {blob}"))
+            .expect("basic placeholder should resolve");
+        let expected = format!("Basic {}", engine.encode("x-access-token:ghp_real"));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn leaves_basic_without_placeholder_untouched() {
+        let (_child, resolver) = SecretResolver::from_provider_env(
+            [("GITHUB_TOKEN".to_string(), "ghp_real".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.unwrap();
+        use base64::Engine as _;
+        let blob = base64::engine::general_purpose::STANDARD.encode("user:realpassword");
+        assert!(resolver.rewrite_header_value(&format!("Basic {blob}")).is_none());
+    }
 
     #[test]
     fn provider_env_is_replaced_with_placeholders() {
